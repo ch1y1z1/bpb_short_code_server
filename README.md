@@ -97,3 +97,6 @@ curl -sS -X POST 'http://127.0.0.1:3000/decode' \
 
 - 短码生成：使用 SQLite 自增 `id` 做 base62 编码，天然唯一；不足 2 位会在左侧补 `0`。
 - 存储：SQLite 表 `mappings`，其中 `value` 和 `code` 都是 `UNIQUE`，保证去重与反查。
+- 统计与审计：
+  - `mappings.decode_count`：该记录被成功 `decode` 的次数（每次成功 `POST /decode` 会 +1）。
+  - `events` 表：记录每次成功的 `encode/decode` 调用时间（`created_at`）以及当时的 `code/value`。

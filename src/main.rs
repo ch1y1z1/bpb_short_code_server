@@ -169,6 +169,7 @@ async fn init_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             code        TEXT UNIQUE,
             value       TEXT NOT NULL UNIQUE,
+            decode_count INTEGER NOT NULL DEFAULT 0,
             created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
         );
         "#,
@@ -177,6 +178,38 @@ async fn init_db(pool: &sqlx::SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(r#"CREATE INDEX IF NOT EXISTS idx_mappings_code ON mappings(code);"#)
+        .execute(pool)
+        .await?;
+
+    // 向后兼容：如果老库没有 decode_count 字段，补上
+    // SQLite 没有 IF NOT EXISTS for column，这里重复执行会报错，我们忽略“duplicate column name”。
+    if let Err(e) = sqlx::query(r#"ALTER TABLE mappings ADD COLUMN decode_count INTEGER NOT NULL DEFAULT 0;"#)
+        .execute(pool)
+        .await
+    {
+        let msg = e.to_string();
+        if !msg.contains("duplicate column name") {
+            return Err(e);
+        }
+    }
+
+    // 事件表：记录每次 encode/decode 的时间
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            action      TEXT NOT NULL, -- 'encode' | 'decode'
+            mapping_id  INTEGER,
+            code        TEXT,
+            value       TEXT,
+            created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(r#"CREATE INDEX IF NOT EXISTS idx_events_created_at ON events(created_at);"#)
         .execute(pool)
         .await?;
 
@@ -189,11 +222,18 @@ async fn encode(State(state): State<AppState>, Json(req): Json<EncodeRequest>) -
     }
 
     // 快路径：已存在则直接返回
-    if let Some(code) = sqlx::query_scalar::<_, String>("SELECT code FROM mappings WHERE value = ?1")
+    if let Some((id, code)) = sqlx::query_as::<_, (i64, String)>("SELECT id, code FROM mappings WHERE value = ?1")
         .bind(&req.value)
         .fetch_optional(&state.pool)
         .await?
     {
+        // 记录事件
+        sqlx::query("INSERT INTO events (action, mapping_id, code, value) VALUES ('encode', ?1, ?2, ?3)")
+            .bind(id)
+            .bind(&code)
+            .bind(&req.value)
+            .execute(&state.pool)
+            .await?;
         return Ok(Json(EncodeResponse { code }));
     }
 
@@ -230,6 +270,14 @@ async fn encode(State(state): State<AppState>, Json(req): Json<EncodeRequest>) -
         code
     };
 
+    // 记录事件（encode 成功）
+    sqlx::query("INSERT INTO events (action, mapping_id, code, value) VALUES ('encode', ?1, ?2, ?3)")
+        .bind(id)
+        .bind(&final_code)
+        .bind(&req.value)
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit().await?;
     Ok(Json(EncodeResponse { code: final_code }))
 }
@@ -237,11 +285,31 @@ async fn encode(State(state): State<AppState>, Json(req): Json<EncodeRequest>) -
 async fn decode(State(state): State<AppState>, Json(req): Json<DecodeRequest>) -> ApiResult<DecodeResponse> {
     validate_code(&req.code)?;
 
-    let value = sqlx::query_scalar::<_, String>("SELECT value FROM mappings WHERE code = ?1")
+    // 事务：读 value + decode_count++ + 写事件，保证统计不漏
+    let mut tx = state.pool.begin().await?;
+
+    let row = sqlx::query("SELECT id, value FROM mappings WHERE code = ?1")
         .bind(&req.code)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(ApiError::NotFound)?;
+
+    let id: i64 = row.get("id");
+    let value: String = row.get("value");
+
+    sqlx::query("UPDATE mappings SET decode_count = decode_count + 1 WHERE id = ?1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    sqlx::query("INSERT INTO events (action, mapping_id, code, value) VALUES ('decode', ?1, ?2, ?3)")
+        .bind(id)
+        .bind(&req.code)
+        .bind(&value)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
 
     Ok(Json(DecodeResponse { value }))
 }
