@@ -6,8 +6,12 @@ use axum::{
     routing::post,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, sqlite::SqlitePoolOptions};
+use sqlx::{
+    Row,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
+};
 use std::path::Path;
+use std::{str::FromStr, time::Duration};
 use tracing::{error, info};
 
 #[derive(Clone)]
@@ -86,9 +90,35 @@ async fn main() -> anyhow::Result<()> {
 
     ensure_sqlite_file_exists(&db_url)?;
 
+    // SQLite 是文件级锁模型：并发写入时容易 SQLITE_BUSY（code=5 / "database is locked"）。
+    // 这里设置 busy_timeout 让它等待锁释放，同时（文件库）启用 WAL 以提升并发读写能力。
+    let sqlite_max_connections: u32 = std::env::var("SQLITE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let sqlite_busy_timeout_ms: u64 = std::env::var("SQLITE_BUSY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000);
+
+    let is_memory_db = match sqlite_file_path_from_url(&db_url) {
+        None => db_url == "sqlite::memory:",
+        Some(p) => p == ":memory:" || p == "file::memory:",
+    };
+
+    let mut connect_options = SqliteConnectOptions::from_str(&db_url)?
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(sqlite_busy_timeout_ms));
+
+    if !is_memory_db {
+        connect_options = connect_options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+    }
+
     let pool = SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect(&db_url)
+        .max_connections(sqlite_max_connections)
+        .connect_with(connect_options)
         .await?;
 
     init_db(&pool).await?;
